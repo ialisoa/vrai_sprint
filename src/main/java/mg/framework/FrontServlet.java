@@ -12,6 +12,8 @@ import java.util.ArrayList;
 import java.util.regex.Pattern;
 import java.util.regex.Matcher;
 import java.util.Map;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import mg.framework.annotations.RequestParam;
@@ -101,6 +103,13 @@ public class FrontServlet extends HttpServlet {
                                             }
                                         }
                                     }
+                                    // Lier les objets personnalisés
+                                    Map<String, Object> customObjects = bindCustomObjects(params, request);
+                                    for (int i = 0; i < params.length; i++) {
+                                        if (args[i] == null && isCustomObject(params[i].getType())) {
+                                            args[i] = customObjects.get(params[i].getName());
+                                        }
+                                    }
                                 } 
                             }
                         } else {
@@ -118,6 +127,13 @@ public class FrontServlet extends HttpServlet {
                                     args[i] = getDefaultValue(params[i].getType());
                                 } else if (isMapStringObject(params[i])) {
                                     args[i] = request.getParameterMap();
+                                }
+                            }
+                            // Lier les objets personnalisés
+                            Map<String, Object> customObjects = bindCustomObjects(params, request);
+                            for (int i = 0; i < params.length; i++) {
+                                if (args[i] == null && isCustomObject(params[i].getType())) {
+                                    args[i] = customObjects.get(params[i].getName());
                                 }
                             }
                         }
@@ -183,10 +199,181 @@ public class FrontServlet extends HttpServlet {
     private Object convertValue(String value, Class<?> type) {
         if (type == int.class || type == Integer.class) {
             return Integer.parseInt(value);
+        } else if (type == double.class || type == Double.class) {
+            return Double.parseDouble(value);
+        } else if (type == boolean.class || type == Boolean.class) {
+            return Boolean.parseBoolean(value);
+        } else if (type == long.class || type == Long.class) {
+            return Long.parseLong(value);
+        } else if (type == float.class || type == Float.class) {
+            return Float.parseFloat(value);
+        } else if (type == char.class || type == Character.class) {
+            return value.length() > 0 ? value.charAt(0) : '\0';
+        } else if (type == byte.class || type == Byte.class) {
+            return Byte.parseByte(value);
+        } else if (type == short.class || type == Short.class) {
+            return Short.parseShort(value);
         } else if (type == String.class) {
             return value;
         } else {
             throw new IllegalArgumentException("Unsupported type: " + type);
+        }
+    }
+
+    private Map<String, Object> bindCustomObjects(java.lang.reflect.Parameter[] methodParams, HttpServletRequest request) {
+        Map<String, Object> boundObjects = new java.util.HashMap<>();
+        Map<String, String[]> paramMap = request.getParameterMap();
+
+        for (Map.Entry<String, String[]> entry : paramMap.entrySet()) {
+            String paramName = entry.getKey();
+            if (!paramName.contains(".")) continue; // seulement les paramètres de la forme object.*
+            String[] tokens = paramName.split("\\.");
+            if (tokens.length < 2) continue; // doit être au minimum object.prop
+            String rootName = tokens[0];
+            String[] path = java.util.Arrays.copyOfRange(tokens, 1, tokens.length); // chemin restant
+            String[] values = entry.getValue();
+            String value = values.length > 0 ? values[0] : null;
+
+            // trouver le paramètre de méthode correspondant (paramètre racine)
+            for (java.lang.reflect.Parameter param : methodParams) {
+                if (!param.getName().equals(rootName) || !isCustomObject(param.getType())) continue;
+                // créer ou récupérer l'instance racine
+                Object rootInstance = boundObjects.get(rootName);
+                if (rootInstance == null) {
+                    try {
+                        rootInstance = param.getType().getDeclaredConstructor().newInstance();
+                        boundObjects.put(rootName, rootInstance);
+                    } catch (Exception e) {
+                        // impossible de créer l'instance racine, ignorer
+                        break;
+                    }
+                }
+
+                // Parcourir le chemin jusqu'à l'objet final
+                Object current = rootInstance;
+                for (int i = 0; i < path.length - 1; i++) {
+                    String prop = path[i];
+                    Object child = getOrCreateChildInstance(current, prop);
+                    if (child == null) {
+                        current = null; // impossible de continuer
+                        break;
+                    }
+                    current = child;
+                }
+                if (current != null) {
+                    String lastProp = path[path.length - 1];
+                    setProperty(current, lastProp, value);
+                }
+                break; // paramètre racine trouvé, arrêter
+            }
+        }
+        return boundObjects;
+    }
+
+    private Object getOrCreateChildInstance(Object parent, String propertyName) {
+        try {
+            Class<?> clazz = parent.getClass();
+            // essayer le getter
+            String getterName = "get" + propertyName.substring(0, 1).toUpperCase() + propertyName.substring(1);
+            Method getter = null;
+            try {
+                getter = clazz.getMethod(getterName);
+            } catch (NoSuchMethodException e) {
+                // ignorer
+            }
+            if (getter != null) {
+                Object value = getter.invoke(parent);
+                if (value != null) return value;
+            }
+
+            // Si le getter n'existe pas ou la valeur est null, obtenir le type via setter ou champ
+            String setterName = "set" + propertyName.substring(0, 1).toUpperCase() + propertyName.substring(1);
+            Method setter = null;
+            for (Method m : clazz.getMethods()) {
+                if (m.getName().equals(setterName) && m.getParameterCount() == 1) {
+                    setter = m;
+                    break;
+                }
+            }
+            Class<?> childType = null;
+            if (setter != null) childType = setter.getParameterTypes()[0];
+            java.lang.reflect.Field field = null;
+            if (childType == null) {
+                try {
+                    field = clazz.getDeclaredField(propertyName);
+                    childType = field.getType();
+                } catch (NoSuchFieldException nsf) {
+                    // introuvable
+                }
+            }
+            if (childType == null) return null;
+
+            // instancier l'enfant
+            Object childInstance = null;
+            try {
+                childInstance = childType.getDeclaredConstructor().newInstance();
+            } catch (Exception e) {
+                return null; // impossible d'instancier
+            }
+
+            // affecter au parent
+            if (setter != null) {
+                setter.invoke(parent, childInstance);
+                return childInstance;
+            }
+            if (field != null) {
+                field.setAccessible(true);
+                field.set(parent, childInstance);
+                return childInstance;
+            }
+
+            return null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private boolean isCustomObject(Class<?> type) {
+        return !type.isPrimitive() && !type.equals(String.class) && !type.equals(Map.class) && !type.getName().startsWith("java.");
+    }
+
+    private void setProperty(Object instance, String propertyName, String value) {
+        try {
+            Class<?> clazz = instance.getClass();
+            java.lang.reflect.Field field = null;
+            try {
+                field = clazz.getDeclaredField(propertyName);
+            } catch (NoSuchFieldException nsf) {
+                // C'est OK si le champ n'est pas trouvé; on peut toujours essayer le setter
+            }
+
+            // Essayer le setter (même nom et 1 paramètre)
+            String setterName = "set" + propertyName.substring(0, 1).toUpperCase() + propertyName.substring(1);
+            Method setter = null;
+            for (Method m : clazz.getMethods()) {
+                if (m.getName().equals(setterName) && m.getParameterCount() == 1) {
+                    setter = m;
+                    break;
+                }
+            }
+            if (setter != null) {
+                Class<?> paramType = setter.getParameterTypes()[0];
+                Object converted = value == null ? null : convertValue(value, paramType);
+                setter.invoke(instance, converted);
+                return;
+            }
+
+            // Essayer le champ
+            if (field != null) {
+                field.setAccessible(true);
+                if (value == null) {
+                    field.set(instance, null);
+                } else {
+                    field.set(instance, convertValue(value, field.getType()));
+                }
+            }
+        } catch (Exception e) {
+            // Ignorer si pas de setter ou champ ou si la conversion échoue
         }
     }
 
